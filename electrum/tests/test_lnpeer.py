@@ -174,6 +174,7 @@ class MockLNWallet(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.stopping_soon = False
         self.downstream_htlc_to_upstream_peer_map = {}
         self.hold_invoice_callbacks = {}
+        self.payment_bundles = [] # lists of hashes. todo:persist
 
         self.logger.info(f"created LNWallet[{name}] with nodeID={local_keypair.pubkey.hex()}")
 
@@ -278,6 +279,12 @@ class MockLNWallet(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
     suggest_splits = LNWallet.suggest_splits
     register_callback_for_hold_invoice = LNWallet.register_callback_for_hold_invoice
     add_payment_info_for_hold_invoice = LNWallet.add_payment_info_for_hold_invoice
+    # payment bundles
+    get_payment_bundle = LNWallet.get_payment_bundle
+    get_mpp_status = LNWallet.get_mpp_status
+    update_mpp_status = LNWallet.update_mpp_status
+    maybe_cleanup_mpp_htlcs = LNWallet.maybe_cleanup_mpp_htlcs
+
 
 class MockTransport:
     def __init__(self, name):

@@ -677,6 +677,8 @@ class LNWallet(LNWorker):
         # map forwarded htlcs (fw_info=(scid_hex, htlc_id)) to originating peer pubkeys
         self.downstream_htlc_to_upstream_peer_map = {}  # type: Dict[Tuple[str, int], bytes]
         self.hold_invoice_callbacks = {}                # payment_hash -> callback, timeout
+        self.payment_bundles = []                       # lists of hashes. todo:persist
+
 
     def has_deterministic_node_id(self) -> bool:
         return bool(self.db.get('lightning_xprv'))
@@ -1862,6 +1864,14 @@ class LNWallet(LNWorker):
             self.wallet.save_db()
         return payment_hash
 
+    def bundle_payments(self, hash_list):
+        self.payment_bundles.append(hash_list)
+
+    def get_payment_bundle(self, payment_hash):
+        for hash_list in self.payment_bundles:
+            if payment_hash in hash_list:
+                return hash_list
+
     def save_preimage(self, payment_hash: bytes, preimage: bytes, *, write_to_disk: bool = True):
         assert sha256(preimage) == payment_hash
         self.preimages[payment_hash.hex()] = preimage.hex()
@@ -1901,6 +1911,8 @@ class LNWallet(LNWorker):
         """ return MPP status: True (accepted), False (expired) or None (waiting)
         """
         payment_hash = htlc.payment_hash
+        self.update_mpp_status(payment_secret, short_channel_id, htlc, expected_msat)
+
         preimage = self.get_preimage(payment_hash)
         callback = self.hold_invoice_callbacks.get(payment_hash)
         if not preimage and callback:
@@ -1911,17 +1923,43 @@ class LNWallet(LNWorker):
             else:
                 return False
 
+        bundle = self.get_payment_bundle(payment_hash)
+        if bundle:
+            secrets = [self.get_payment_secret(h) for h in bundle]
+            bundle_status = [self.get_mpp_status(s) for s in secrets]
+            if all(x is True for x in bundle_status):
+                status = True
+            elif any(x is False for x in bundle_status):
+                status = False
+            else:
+                status = None
+        else:
+            status = self.get_mpp_status(payment_secret)
+
+        if status is not None:
+            self.maybe_cleanup_mpp_htlcs(payment_secret, short_channel_id, htlc)
+
+        return status
+
+    def get_mpp_status(self, payment_secret):
+        is_expired, is_accepted, htlc_set = self.received_mpp_htlcs.get(payment_secret, (False, False, set()))
+        return True if is_accepted else (False if is_expired else None)
+
+    def update_mpp_status(self, payment_secret, short_channel_id, htlc, expected_msat):
+        """ updates as side effect """
+        key = (short_channel_id, htlc)
         amt_to_forward = htlc.amount_msat # check this
         if amt_to_forward >= expected_msat:
             # not multi-part
-            return True
-
+            is_accepted = True
+            is_expired = False
+            self.received_mpp_htlcs[payment_secret] = is_expired, is_accepted, set([key])
+            return
         is_expired, is_accepted, htlc_set = self.received_mpp_htlcs.get(payment_secret, (False, False, set()))
-        if self.get_payment_status(payment_hash) == PR_PAID:
+        if self.get_payment_status(htlc.payment_hash) == PR_PAID:
             # payment_status is persisted
             is_accepted = True
             is_expired = False
-        key = (short_channel_id, htlc)
         if key not in htlc_set:
             htlc_set.add(key)
         if not is_accepted and not is_expired:
@@ -1933,13 +1971,17 @@ class LNWallet(LNWorker):
                 is_expired = True
             elif total == expected_msat:
                 is_accepted = True
-        if is_accepted or is_expired:
-            htlc_set.remove(key)
+        self.received_mpp_htlcs[payment_secret] = is_expired, is_accepted, htlc_set
+
+    def maybe_cleanup_mpp_htlcs(self, payment_secret, short_channel_id, htlc):
+        key = (short_channel_id, htlc)
+        is_expired, is_accepted, htlc_set = self.received_mpp_htlcs.get(payment_secret, (False, False, set()))
+        assert is_accepted or is_expired
+        htlc_set.remove(key)
         if len(htlc_set) > 0:
             self.received_mpp_htlcs[payment_secret] = is_expired, is_accepted, htlc_set
         elif payment_secret in self.received_mpp_htlcs:
             self.received_mpp_htlcs.pop(payment_secret)
-        return True if is_accepted else (False if is_expired else None)
 
     def get_payment_status(self, payment_hash: bytes) -> int:
         info = self.get_payment_info(payment_hash)
